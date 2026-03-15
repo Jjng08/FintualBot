@@ -40,6 +40,12 @@ export interface IConfiguration {
   
   /** Secondary market data API key (optional fallback) */
   secondaryApiKey?: string;
+
+  /** Fintual account email for authentication */
+  fintualEmail?: string;
+
+  /** Fintual account password for authentication */
+  fintualPassword?: string;
 }
 
 /**

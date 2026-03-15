@@ -1,123 +1,130 @@
 /**
  * Market API Client
  * Validates: Requirements 7.1, 7.2, 7.3, 7.4
- * 
- * Obtains market price data from external APIs with fallback support.
- * Validates prices and symbols to ensure data quality.
+ *
+ * Fuente primaria: Yahoo Finance (precio en tiempo real del ETF en NYSE)
+ * Fuente secundaria: Fintual API (precio del fondo equivalente, con retraso)
+ *
+ * La lógica de arbitraje se basa en que Yahoo Finance refleja el precio
+ * actual del mercado, mientras que Fintual actualiza sus precios con retraso.
+ * Cuando el ETF sube ≥1.5% en NYSE, hay una ventana para comprar en Fintual
+ * antes de que actualice su precio.
  */
 
+import yahooFinance from 'yahoo-finance2';
 import { CircuitBreaker, retryWithBackoff, CategorizedError, ErrorCategory } from '../utils/errorHandling';
 
-/**
- * Interface for Market API Client
- * Defines the contract for obtaining market data
- */
 export interface IMarketAPIClient {
   getPrice(symbol: string): Promise<number>;
   getPrices(symbols: string[]): Promise<Map<string, number>>;
   validateSymbol(symbol: string): Promise<boolean>;
+  getFintualPrice(symbol: string): Promise<number | null>;
+  getFintualAssets(): Promise<FintualAsset[]>;
 }
 
-/**
- * MarketAPIClient class
- * Obtains market prices from external APIs with fallback support
- * 
- * Validates: Requirements 7.1, 7.2, 7.3, 7.4
- */
+export interface FintualAsset {
+  id: string;
+  name: string;
+  symbol: string;
+  nav: number;       // Net Asset Value (precio actual del fondo)
+  date: string;
+}
+
+interface FintualTokenResponse {
+  data: {
+    id: string;
+    type: string;
+    attributes: {
+      token: string;
+      email: string;
+    };
+  };
+}
+
+interface FintualRealAsset {
+  id: string;
+  attributes: {
+    name: string;
+    symbol: string;
+    last_day: {
+      net_asset_value: number;
+      date: string;
+    };
+  };
+}
+
+const FINTUAL_BASE_URL = 'https://fintual.cl/api';
+
 export class MarketAPIClient implements IMarketAPIClient {
-  private _primaryApiKey: string;
-  private secondaryApiKey?: string;
+  private fintualEmail?: string;
+  private fintualPassword?: string;
+  private fintualToken?: string;
+  private fintualTokenExpiry?: Date;
   private primaryCircuitBreaker: CircuitBreaker;
   private secondaryCircuitBreaker: CircuitBreaker;
 
-  /**
-   * Creates a new MarketAPIClient instance
-   * 
-   * @param primaryApiKey - API key for primary market data source
-   * @param secondaryApiKey - Optional API key for fallback source
-   */
-  constructor(primaryApiKey: string, secondaryApiKey?: string) {
-    this._primaryApiKey = primaryApiKey;
-    this.secondaryApiKey = secondaryApiKey;
+  constructor(_primaryApiKey?: string, _secondaryApiKey?: string, fintualEmail?: string, fintualPassword?: string) {
+    this.fintualEmail = fintualEmail;
+    this.fintualPassword = fintualPassword;
     this.primaryCircuitBreaker = new CircuitBreaker(5, 60000);
     this.secondaryCircuitBreaker = new CircuitBreaker(5, 60000);
   }
 
   /**
-   * Gets the current price for a single symbol
-   * Attempts primary API first, falls back to secondary if available
-   * Uses circuit breaker and retry mechanisms for resilience
-   * 
-   * Validates: Requirements 7.1, 7.2, 7.3, 7.4
-   * 
-   * @param symbol - Asset symbol (e.g., "VTI", "SPY")
-   * @returns Current price of the asset
-   * @throws Error if price cannot be obtained or is invalid
+   * Obtiene el precio actual de un símbolo.
+   * Primaria: Yahoo Finance. Secundaria: Fintual.
    */
   async getPrice(symbol: string): Promise<number> {
     let lastError: Error | null = null;
 
-    // Try primary API first with circuit breaker and retry (Requirement 7.1, 7.2)
+    // Primaria: Yahoo Finance
     try {
-      console.log(`[MarketAPIClient] Fetching price for ${symbol} from primary API`);
-      
       const price = await this.primaryCircuitBreaker.execute(async () => {
         return await retryWithBackoff(
-          async () => await this.fetchPriceFromPrimaryAPI(symbol),
+          async () => await this.fetchFromYahooFinance(symbol),
           3,
           1000
         );
       });
-      
-      // Validate price is positive number > 0 (Requirement 7.3)
+
       if (!this.isValidPrice(price)) {
-        throw new CategorizedError(
-          `Invalid price received from primary API: ${price}`,
-          ErrorCategory.VALIDATION,
-          symbol
-        );
+        throw new CategorizedError(`Precio inválido de Yahoo Finance: ${price}`, ErrorCategory.VALIDATION, symbol);
       }
-      
-      console.log(`[MarketAPIClient] Successfully fetched ${symbol} price from primary API: ${price}`);
+
+      console.log(`[MarketAPIClient] Yahoo Finance ${symbol}: $${price}`);
       return price;
     } catch (error) {
-      console.warn(`[MarketAPIClient] Primary API failed for ${symbol}:`, error);
+      console.warn(`[MarketAPIClient] Yahoo Finance falló para ${symbol}:`, (error as Error).message);
       lastError = error as Error;
     }
 
-    // Try secondary API if available (Requirement 7.2)
-    if (this.secondaryApiKey) {
-      try {
-        console.log(`[MarketAPIClient] Fetching price for ${symbol} from secondary API`);
-        
-        const price = await this.secondaryCircuitBreaker.execute(async () => {
-          return await retryWithBackoff(
-            async () => await this.fetchPriceFromSecondaryAPI(symbol),
-            3,
-            1000
-          );
-        });
-        
-        // Validate price is positive number > 0 (Requirement 7.3)
-        if (!this.isValidPrice(price)) {
-          throw new CategorizedError(
-            `Invalid price received from secondary API: ${price}`,
-            ErrorCategory.VALIDATION,
-            symbol
-          );
-        }
-        
-        console.log(`[MarketAPIClient] Successfully fetched ${symbol} price from secondary API: ${price}`);
-        return price;
-      } catch (error) {
-        console.error(`[MarketAPIClient] Secondary API also failed for ${symbol}:`, error);
-        lastError = error as Error;
+    // Secundaria: Fintual
+    try {
+      const price = await this.secondaryCircuitBreaker.execute(async () => {
+        return await retryWithBackoff(
+          async () => {
+            const p = await this.getFintualPrice(symbol);
+            if (p === null) throw new Error(`Sin fondo Fintual para ${symbol}`);
+            return p;
+          },
+          3,
+          1000
+        );
+      });
+
+      if (!this.isValidPrice(price)) {
+        throw new CategorizedError(`Precio inválido de Fintual: ${price}`, ErrorCategory.VALIDATION, symbol);
       }
+
+      console.log(`[MarketAPIClient] Fintual fallback ${symbol}: $${price}`);
+      return price;
+    } catch (error) {
+      console.error(`[MarketAPIClient] Fintual también falló para ${symbol}:`, (error as Error).message);
+      lastError = error as Error;
     }
 
-    // Both APIs failed (Requirement 7.4)
     throw new CategorizedError(
-      `Failed to fetch price for ${symbol}: ${lastError?.message || 'Unknown error'}`,
+      `No se pudo obtener precio para ${symbol}: ${lastError?.message}`,
       ErrorCategory.NETWORK,
       symbol,
       lastError || undefined
@@ -125,31 +132,19 @@ export class MarketAPIClient implements IMarketAPIClient {
   }
 
   /**
-   * Gets current prices for multiple symbols in batch
-   * Processes each symbol independently - failures don't affect other symbols
-   * 
-   * Validates: Requirements 7.1, 7.2, 7.5
-   * 
-   * @param symbols - Array of asset symbols
-   * @returns Map of symbol to price for successfully fetched prices
+   * Obtiene precios para múltiples símbolos en paralelo.
    */
   async getPrices(symbols: string[]): Promise<Map<string, number>> {
     const prices = new Map<string, number>();
-    
-    // Process each symbol independently (Requirement 7.5)
     const results = await Promise.allSettled(
-      symbols.map(async (symbol) => {
-        const price = await this.getPrice(symbol);
-        return { symbol, price };
-      })
+      symbols.map(async (symbol) => ({ symbol, price: await this.getPrice(symbol) }))
     );
 
-    // Collect successful results
     for (const result of results) {
       if (result.status === 'fulfilled') {
         prices.set(result.value.symbol, result.value.price);
       } else {
-        console.error(`[MarketAPIClient] Failed to fetch price:`, result.reason);
+        console.error(`[MarketAPIClient] Error obteniendo precio:`, result.reason);
       }
     }
 
@@ -157,97 +152,131 @@ export class MarketAPIClient implements IMarketAPIClient {
   }
 
   /**
-   * Validates if a symbol is valid and tradeable
-   * 
-   * Validates: Requirement 1.3
-   * 
-   * @param symbol - Asset symbol to validate
-   * @returns true if symbol is valid, false otherwise
+   * Valida si un símbolo existe en Yahoo Finance.
    */
   async validateSymbol(symbol: string): Promise<boolean> {
     try {
-      console.log(`[MarketAPIClient] Validating symbol: ${symbol}`);
-      const isValid = await this.validateSymbolWithAPI(symbol);
-      console.log(`[MarketAPIClient] Symbol ${symbol} validation result: ${isValid}`);
-      return isValid;
-    } catch (error) {
-      console.error(`[MarketAPIClient] Error validating symbol ${symbol}:`, error);
-      return false;
+      const quote = await yahooFinance.quote(symbol, {}, { validateResult: false });
+      return !!(quote as { regularMarketPrice?: number })?.regularMarketPrice;
+    } catch {
+      return /^[A-Z]{1,5}$/.test(symbol);
     }
   }
 
   /**
-   * Validates if a price is a positive number greater than zero
-   * 
-   * Validates: Requirement 7.3
-   * 
-   * @param price - Price value to validate
-   * @returns true if price is valid, false otherwise
+   * Obtiene el precio NAV del fondo Fintual más cercano al símbolo dado.
+   * Busca entre todos los real_assets disponibles por nombre.
    */
+  async getFintualPrice(symbol: string): Promise<number | null> {
+    try {
+      const assets = await this.getFintualAssets();
+      // Busca el fondo cuyo nombre o símbolo contenga el símbolo del ETF
+      const match = assets.find(a =>
+        a.symbol?.toUpperCase().includes(symbol.toUpperCase()) ||
+        a.name?.toUpperCase().includes(symbol.toUpperCase())
+      );
+      return match ? match.nav : null;
+    } catch (error) {
+      console.error(`[MarketAPIClient] Error buscando precio Fintual para ${symbol}:`, (error as Error).message);
+      return null;
+    }
+  }
+
+  /**
+   * Obtiene todos los activos disponibles en Fintual con su precio NAV actual.
+   * Requiere autenticación si las credenciales están configuradas.
+   */
+  async getFintualAssets(): Promise<FintualAsset[]> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+    // Autenticar si hay credenciales
+    if (this.fintualEmail && this.fintualPassword) {
+      const token = await this.getFintualToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    // Obtener todos los real_assets (fondos con precio NAV)
+    const response = await fetch(`${FINTUAL_BASE_URL}/real_assets`, { headers });
+
+    if (!response.ok) {
+      // Si falla con auth, intentar sin auth (datos públicos)
+      const publicResponse = await fetch(`${FINTUAL_BASE_URL}/real_assets`);
+      if (!publicResponse.ok) throw new Error(`Fintual API error: ${publicResponse.status}`);
+      return this.parseFintualAssets(await publicResponse.json() as { data?: FintualRealAsset[] });
+    }
+
+    return this.parseFintualAssets(await response.json() as { data?: FintualRealAsset[] });
+  }
+
+  // ─── Métodos privados ────────────────────────────────────────────────────────
+
+  private async fetchFromYahooFinance(symbol: string): Promise<number> {
+    const quote = await yahooFinance.quote(symbol, {}, { validateResult: false }) as {
+      regularMarketPrice?: number;
+      ask?: number;
+      bid?: number;
+    };
+
+    const price = quote?.regularMarketPrice ?? quote?.ask ?? quote?.bid;
+    if (!price) throw new Error(`Sin precio disponible para ${symbol} en Yahoo Finance`);
+    return price;
+  }
+
+  /**
+   * Obtiene o renueva el token de autenticación de Fintual.
+   */
+  private async getFintualToken(): Promise<string | null> {
+    // Reusar token si aún es válido (tokens duran ~24h, renovamos cada 12h)
+    if (this.fintualToken && this.fintualTokenExpiry && new Date() < this.fintualTokenExpiry) {
+      return this.fintualToken;
+    }
+
+    try {
+      const response = await fetch(`${FINTUAL_BASE_URL}/access_tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user: {
+            email: this.fintualEmail,
+            password: this.fintualPassword
+          }
+        })
+      });
+
+      if (!response.ok) {
+        console.error(`[MarketAPIClient] Fintual auth falló: ${response.status}`);
+        return null;
+      }
+
+      const data = await response.json() as FintualTokenResponse;
+      this.fintualToken = data?.data?.attributes?.token;
+
+      // Token válido por 12 horas
+      this.fintualTokenExpiry = new Date(Date.now() + 12 * 60 * 60 * 1000);
+
+      console.log(`[MarketAPIClient] Autenticado en Fintual como ${this.fintualEmail}`);
+      return this.fintualToken ?? null;
+    } catch (error) {
+      console.error(`[MarketAPIClient] Error autenticando en Fintual:`, (error as Error).message);
+      return null;
+    }
+  }
+
+  private parseFintualAssets(data: { data?: FintualRealAsset[] }): FintualAsset[] {
+    if (!data?.data || !Array.isArray(data.data)) return [];
+
+    return data.data
+      .filter(asset => asset?.attributes?.last_day?.net_asset_value)
+      .map(asset => ({
+        id: asset.id,
+        name: asset.attributes.name,
+        symbol: asset.attributes.symbol,
+        nav: asset.attributes.last_day.net_asset_value,
+        date: asset.attributes.last_day.date
+      }));
+  }
+
   private isValidPrice(price: number): boolean {
-    return typeof price === 'number' && 
-           !isNaN(price) && 
-           isFinite(price) && 
-           price > 0;
-  }
-
-  /**
-   * Fetches price from primary API
-   * This is a placeholder implementation - should be replaced with actual API integration
-   * 
-   * @param _symbol - Asset symbol
-   * @returns Price from primary API
-   */
-  private async fetchPriceFromPrimaryAPI(_symbol: string): Promise<number> {
-    // TODO: Implement actual API integration (e.g., Alpha Vantage, Yahoo Finance)
-    // For now, this is a placeholder that simulates API behavior
-    // The _primaryApiKey will be used in the actual implementation
-    void this._primaryApiKey; // Placeholder - will be used in actual API integration
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // This is a mock implementation - replace with actual API call
-    // Example for Alpha Vantage:
-    // const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${_symbol}&apikey=${this._primaryApiKey}`;
-    // const response = await fetch(url);
-    // const data = await response.json();
-    // return parseFloat(data['Global Quote']['05. price']);
-    
-    throw new Error('Primary API not implemented - replace with actual API integration');
-  }
-
-  /**
-   * Fetches price from secondary API
-   * This is a placeholder implementation - should be replaced with actual API integration
-   * 
-   * @param _symbol - Asset symbol
-   * @returns Price from secondary API
-   */
-  private async fetchPriceFromSecondaryAPI(_symbol: string): Promise<number> {
-    // TODO: Implement actual API integration for fallback source
-    // For now, this is a placeholder that simulates API behavior
-    
-    // Simulate API call delay
-    await new Promise(resolve => setTimeout(resolve, 100));
-    
-    // This is a mock implementation - replace with actual API call
-    throw new Error('Secondary API not implemented - replace with actual API integration');
-  }
-
-  /**
-   * Validates symbol with API
-   * This is a placeholder implementation - should be replaced with actual API integration
-   * 
-   * @param symbol - Asset symbol to validate
-   * @returns true if symbol is valid
-   */
-  private async validateSymbolWithAPI(symbol: string): Promise<boolean> {
-    // TODO: Implement actual symbol validation with API
-    // For now, use basic validation rules
-    
-    // Basic validation: 1-5 uppercase letters
-    const symbolRegex = /^[A-Z]{1,5}$/;
-    return symbolRegex.test(symbol);
+    return typeof price === 'number' && !isNaN(price) && isFinite(price) && price > 0;
   }
 }

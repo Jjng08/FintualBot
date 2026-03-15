@@ -51,7 +51,9 @@ async function main(): Promise<void> {
     logger.info('Initializing Market API Client...');
     const marketAPIClient = new MarketAPIClient(
       config.primaryApiKey,
-      config.secondaryApiKey
+      config.secondaryApiKey,
+      config.fintualEmail,
+      config.fintualPassword
     );
     logger.info('Market API Client initialized');
 

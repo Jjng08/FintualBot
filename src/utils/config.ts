@@ -74,6 +74,10 @@ export function loadConfiguration(): IConfiguration {
   
   // Read optional secondary API key
   const secondaryApiKey = process.env.SECONDARY_API_KEY;
+
+  // Read optional Fintual credentials
+  const fintualEmail = process.env.FINTUAL_USER;
+  const fintualPassword = process.env.FINTUAL_PASSWORD;
   
   // Validate numeric values
   if (isNaN(priceChangeThreshold) || priceChangeThreshold <= 0) {
@@ -125,7 +129,9 @@ export function loadConfiguration(): IConfiguration {
     telegramToken,
     telegramChatId,
     primaryApiKey,
-    secondaryApiKey
+    secondaryApiKey,
+    fintualEmail,
+    fintualPassword
   };
 }
 
